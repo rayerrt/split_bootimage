@@ -21,18 +21,21 @@
 #
 ######################################################################
 import gzip
+from optparse import OptionParser
 import os
 import string
 import struct
 import sys
 ######################################################################
 ## Global Variables and Constants
-SCRIPT = sys.argv[0]
 
 PAGE_SIZE = 0
 KERNEL_SIZE = 0
 RAMDISK_SIZE =  0
 SECOND_SIZE = 0
+
+HASE_DT = False
+DT_SIZE = 0
 
 # Constants (from bootimg.h)
 BOOT_MAGIC = 'ANDROID!'
@@ -43,8 +46,8 @@ BOOT_ARGS_SIZE = 512
 # Unsigned integers are 4 bytes
 UNSIGNED_SIZE = 4
 ######################################################################
-def goto_exit(errorinfo):
-	print "Error:%s" %errorinfo
+def goto_exit(tip, info):
+	print "%s  %s" %(tip, info)
 	sys.exit(1)
 ######################################################################
 ## Supporting Subroutines
@@ -65,6 +68,7 @@ struct boot_img_hdr
 
     unsigned tags_addr;    /* physical addr for kernel tags */
     unsigned page_size;    /* flash page size we assume */
+    unsigned dt_size;      /* device tree in bytes optional*/
     unsigned unused[2];    /* future expansion: should be 0 */
 
     unsigned char name[BOOT_NAME_SIZE]; /* asciiz product name */
@@ -80,6 +84,7 @@ def parse_header(fn):
 	global KERNEL_SIZE
 	global RAMDISK_SIZE
 	global SECOND_SIZE
+	global DT_SIZE
 
 	global UNSIGNED_SIZE
 		
@@ -113,8 +118,15 @@ def parse_header(fn):
     		buf = INF.read(UNSIGNED_SIZE)
 		p_size = struct.unpack("I", buf)[0]
 
+		if HAS_DT:
+			print "get the dt size (assume little-endian)"
+    			# get the dt size (assume little-endian)
+    			buf = INF.read(UNSIGNED_SIZE)
+			d_size = struct.unpack("I", buf)[0]
+			print "dt.img size: %d (0x%08x)" %(d_size, d_size)
+			DT_SIZE = d_size
+
     		# Ignore unused
-		buf = INF.read(UNSIGNED_SIZE)
 		buf = INF.read(UNSIGNED_SIZE)
 
     		# Read the name (board name)
@@ -145,7 +157,7 @@ def parse_header(fn):
     		SECOND_SIZE = s_size
 
 	except IOError:
-		goto_exit("Open %s Failed!" %fn)
+		goto_exit("Error:", "Open %s Failed!" %fn)
 	finally:
     		# Close the file
 		INF.close()
@@ -168,23 +180,35 @@ def gunzip_file(infn, outfn):
 		OUTF.close()
 		INF.close()
 	except Exception:
-		goto_exit("Gunzip %s to %s Failed!" %(infn, outfn))
+		goto_exit("Error:", "Gunzip %s to %s Failed!" %(infn, outfn))
 ######################################################################
 ## Configuration Subroutines
 def parse_cmdline():
-	global SCRIPT
-	global IMAGE_FN
-	if len(sys.argv) < 2:
-		print "Usage: %s boot.img\n" %SCRIPT
-		print "Usage: boot.img\n"
-		sys.exit(0)
 
-	IMAGE_FN = sys.argv[1]
+	global HAS_DT
+	global IMAGE_FN
+	
+	HAS_DT = False 
+	IMAGE_FN = ""
+
+	USAGE = "%s [-d] boot/recovery.img" %sys.argv[0]
+	parser = OptionParser(USAGE)
+	parser.add_option("-d", action="store_true", dest="has_dt", help = "if dt.img exists, use the option")
+
+	(options, args) = parser.parse_args()
+	if options.has_dt:
+		HAS_DT = True
+
+	if len(args) != 1:
+		goto_exit("Usage:", USAGE)
+	else:
+		IMAGE_FN = args[0]
+
 	if not os.path.exists(IMAGE_FN):
-		goto_exit("%s not found!" %IMAGE_FN)
+		goto_exit("Error:", "%s not found!" %IMAGE_FN)
 ######################################################################
 '''
-=format (from bootimg.h)
+*
 ** +-----------------+
 ** | boot header     | 1 page
 ** +-----------------+
@@ -194,16 +218,33 @@ def parse_cmdline():
 ** +-----------------+
 ** | second stage    | o pages
 ** +-----------------+
+** | device tree     | p pages
+** +-----------------+
 **
 ** n = (kernel_size + page_size - 1) / page_size
 ** m = (ramdisk_size + page_size - 1) / page_size
 ** o = (second_size + page_size - 1) / page_size
+** p = (dt_size + page_size - 1) / page_size
+**
+** 0. all entities are page_size aligned in flash
+** 1. kernel and ramdisk are required (size != 0)
+** 2. second is optional (second_size == 0 -> no second)
+** 3. load each element (kernel, ramdisk, second) at
+**    the specified physical address (kernel_addr, etc)
+** 4. prepare tags at tag_addr.  kernel_args[] is
+**    appended to the kernel commandline in the tags.
+** 5. r0 = 0, r1 = MACHINE_TYPE, r2 = tags_addr
+** 6. if second_size != 0: jump to second_addr
+**    else: jump to kernel_addr
+*/
+
 '''
 ## Main Code
 def main():
 	parse_cmdline()
 	parse_header(IMAGE_FN)
-	
+	p = 0	
+	d_offset = 0
 	n = int((KERNEL_SIZE + PAGE_SIZE - 1) / PAGE_SIZE)
 	m = int((RAMDISK_SIZE + PAGE_SIZE - 1) / PAGE_SIZE)
 	o = int((SECOND_SIZE + PAGE_SIZE - 1) / PAGE_SIZE)
@@ -211,12 +252,16 @@ def main():
 	k_offset = PAGE_SIZE
 	r_offset = k_offset + (n * PAGE_SIZE)
 	s_offset = r_offset + (m * PAGE_SIZE)
+	if (DT_SIZE != 0):
+		p = int((DT_SIZE + PAGE_SIZE - 1) / PAGE_SIZE)
+		d_offset = s_offset + (o * PAGE_SIZE)
 
-	base = os.path.basename(IMAGE_FN)
+	base = os.path.basename(IMAGE_FN).split(".")[0]
 	k_file = base + "-kernel"
 	r_file = base + "-ramdisk.gz"
 	r_file_bak = base + "-ramdisk"
 	s_file = base + "-second.gz"
+	d_file = base + "-dt.img"
 
 	# The kernel is always there
 	print "Writing %s ..." %k_file
@@ -235,6 +280,11 @@ def main():
 		print "Writing %s ..." %s_file
 		dump_file(IMAGE_FN, s_file, s_offset, SECOND_SIZE)
 		print "Complete."
+	if (DT_SIZE != 0):
+		print "Writing %s ..." %d_file
+		dump_file(IMAGE_FN, d_file, d_offset, DT_SIZE)
+		print "Complete."
+
 ######################################################################
 if __name__ == "__main__":
 	main()
